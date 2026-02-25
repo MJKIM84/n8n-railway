@@ -47,11 +47,41 @@ async def get_kr_market_data(days: int = 5):
         # 최근 거래일
         recent_date = kospi.index[-1].strftime("%Y%m%d") if not kospi.empty else today
 
+        # 전종목 OHLCV (pykrx 1.2+: market 파라미터 제거)
+        vol_df = None
+        try:
+            vol_df = krx.get_market_ohlcv(recent_date)
+        except Exception:
+            pass
+
+        # 주요 대형주 (스토리 분석에 필수)
+        major_kr_stocks = {}
+        KR_MAJOR_TICKERS = {
+            "005930": "삼성전자", "000660": "SK하이닉스",
+            "373220": "LG에너지솔루션", "005380": "현대차",
+            "035420": "NAVER", "035720": "카카오",
+            "006400": "삼성SDI", "207940": "삼성바이오로직스",
+            "068270": "셀트리온", "005490": "POSCO홀딩스",
+        }
+        if vol_df is not None and not vol_df.empty:
+            for ticker_code, name in KR_MAJOR_TICKERS.items():
+                try:
+                    if ticker_code in vol_df.index:
+                        row = vol_df.loc[ticker_code]
+                        major_kr_stocks[name] = {
+                            "ticker": ticker_code,
+                            "close": int(row["종가"]),
+                            "change_pct": round(float(row["등락률"]), 2),
+                            "volume": int(row["거래량"]),
+                            "market_cap": int(row["시가총액"]) if "시가총액" in vol_df.columns else None,
+                        }
+                except Exception:
+                    continue
+
         # 거래대금 상위 10종목
         top_volume = []
         try:
-            vol_df = krx.get_market_ohlcv(recent_date, recent_date, market="KOSPI")
-            if not vol_df.empty and "거래량" in vol_df.columns:
+            if vol_df is not None and not vol_df.empty and "거래량" in vol_df.columns:
                 vol_sorted = vol_df.nlargest(10, "거래량")
                 for ticker_code in vol_sorted.index:
                     name = krx.get_market_ticker_name(ticker_code)
@@ -69,7 +99,7 @@ async def get_kr_market_data(days: int = 5):
         # 등락률 상위 10종목 (상승)
         top_gainers = []
         try:
-            if not vol_df.empty and "등락률" in vol_df.columns:
+            if vol_df is not None and not vol_df.empty and "등락률" in vol_df.columns:
                 gain_sorted = vol_df.nlargest(10, "등락률")
                 for ticker_code in gain_sorted.index:
                     name = krx.get_market_ticker_name(ticker_code)
@@ -87,7 +117,7 @@ async def get_kr_market_data(days: int = 5):
         # 등락률 하위 10종목 (하락)
         top_losers = []
         try:
-            if not vol_df.empty and "등락률" in vol_df.columns:
+            if vol_df is not None and not vol_df.empty and "등락률" in vol_df.columns:
                 loss_sorted = vol_df.nsmallest(10, "등락률")
                 for ticker_code in loss_sorted.index:
                     name = krx.get_market_ticker_name(ticker_code)
@@ -102,14 +132,15 @@ async def get_kr_market_data(days: int = 5):
         except Exception:
             pass
 
-        # 투자자별 순매수
+        # 투자자별 순매수 (외국인 라벨 수정)
         investor_data = {}
         try:
             inv = krx.get_market_trading_value_by_investor(recent_date, recent_date, "KOSPI")
             if not inv.empty:
-                for label in ["외국인합계", "기관합계", "개인"]:
+                for label in ["외국인", "기관합계", "개인"]:
                     if label in inv.index and "순매수" in inv.columns:
-                        investor_data[label.replace("합계", "")] = int(inv.loc[label, "순매수"])
+                        display_name = label.replace("합계", "")
+                        investor_data[display_name] = int(inv.loc[label, "순매수"])
         except Exception:
             pass
 
@@ -117,6 +148,7 @@ async def get_kr_market_data(days: int = 5):
             "date": recent_date,
             "kospi": kospi_result,
             "kosdaq": kosdaq_result,
+            "major_stocks": major_kr_stocks,
             "top_volume": top_volume,
             "top_gainers": top_gainers,
             "top_losers": top_losers,
@@ -391,6 +423,13 @@ async def get_daily_feed():
             arrow = "▲" if k["change_pct"] > 0 else "▼" if k["change_pct"] < 0 else "─"
             lines.append(f"- KOSDAQ: {k['close']:,.2f} ({arrow}{abs(k['change_pct'])}%)")
         lines.append("")
+
+        if kr.get("major_stocks"):
+            lines.append("### 한국 주요 대형주")
+            for name, data in kr["major_stocks"].items():
+                arrow = "▲" if data["change_pct"] > 0 else "▼" if data["change_pct"] < 0 else "─"
+                lines.append(f"- {name}({data['ticker']}): {data['close']:,}원 ({arrow}{abs(data['change_pct'])}%)")
+            lines.append("")
 
         if kr.get("investor_flow"):
             lines.append("### 투자자별 순매수 (KOSPI)")
