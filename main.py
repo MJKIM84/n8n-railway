@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 import io
@@ -14,7 +14,7 @@ app = FastAPI(title="YouTube Automation - Stock Data API")
 # ============================================================
 @app.get("/api/kr-market")
 async def get_kr_market_data(days: int = 5):
-    """한국 증시 데이터 (KOSPI/KOSDAQ 지수 + 주요 종목)"""
+    """한국 증시 데이터 (KOSPI/KOSDAQ 지수 + 주요 종목 + 거래대금/등락률 상위)"""
     try:
         from pykrx import stock as krx
 
@@ -25,43 +25,7 @@ async def get_kr_market_data(days: int = 5):
         kospi = krx.get_index_ohlcv(start, today, "1001")
         kosdaq = krx.get_index_ohlcv(start, today, "2001")
 
-        # 주요 종목 시세
-        major_tickers = {
-            "005930": "삼성전자",
-            "000660": "SK하이닉스",
-            "005380": "현대차",
-            "035420": "NAVER",
-            "035720": "카카오",
-        }
-
-        stocks = {}
-        for ticker, name in major_tickers.items():
-            df = krx.get_market_ohlcv(start, today, ticker)
-            if not df.empty and len(df) > 1:
-                latest = df.iloc[-1]
-                prev = df.iloc[-2]
-                stocks[name] = {
-                    "ticker": ticker,
-                    "close": int(latest["종가"]),
-                    "change": int(latest["종가"] - prev["종가"]),
-                    "change_pct": round(float(latest["등락률"]), 2),
-                    "volume": int(latest["거래량"]),
-                }
-
-        # 투자자별 순매수
-        investor_data = {}
-        try:
-            # 최근 거래일 찾기
-            recent_date = kospi.index[-1].strftime("%Y%m%d") if not kospi.empty else today
-            inv = krx.get_market_trading_value_by_investor(recent_date, recent_date, "KOSPI")
-            if not inv.empty:
-                for label in ["외국인합계", "기관합계", "개인"]:
-                    if label in inv.index and "순매수" in inv.columns:
-                        investor_data[label.replace("합계", "")] = int(inv.loc[label, "순매수"])
-        except Exception:
-            pass
-
-        # 지수 데이터 추출 (컬럼명: 시가, 고가, 저가, 종가)
+        # 지수 데이터
         kospi_result = None
         if not kospi.empty and len(kospi) > 1:
             kospi_result = {
@@ -80,11 +44,82 @@ async def get_kr_market_data(days: int = 5):
                 "volume": int(kosdaq.iloc[-1]["거래량"]),
             }
 
+        # 최근 거래일
+        recent_date = kospi.index[-1].strftime("%Y%m%d") if not kospi.empty else today
+
+        # 거래대금 상위 10종목
+        top_volume = []
+        try:
+            vol_df = krx.get_market_ohlcv(recent_date, recent_date, market="KOSPI")
+            if not vol_df.empty and "거래량" in vol_df.columns:
+                vol_sorted = vol_df.nlargest(10, "거래량")
+                for ticker_code in vol_sorted.index:
+                    name = krx.get_market_ticker_name(ticker_code)
+                    row = vol_sorted.loc[ticker_code]
+                    top_volume.append({
+                        "ticker": ticker_code,
+                        "name": name,
+                        "close": int(row["종가"]),
+                        "change_pct": round(float(row["등락률"]), 2),
+                        "volume": int(row["거래량"]),
+                    })
+        except Exception:
+            pass
+
+        # 등락률 상위 10종목 (상승)
+        top_gainers = []
+        try:
+            if not vol_df.empty and "등락률" in vol_df.columns:
+                gain_sorted = vol_df.nlargest(10, "등락률")
+                for ticker_code in gain_sorted.index:
+                    name = krx.get_market_ticker_name(ticker_code)
+                    row = gain_sorted.loc[ticker_code]
+                    top_gainers.append({
+                        "ticker": ticker_code,
+                        "name": name,
+                        "close": int(row["종가"]),
+                        "change_pct": round(float(row["등락률"]), 2),
+                        "volume": int(row["거래량"]),
+                    })
+        except Exception:
+            pass
+
+        # 등락률 하위 10종목 (하락)
+        top_losers = []
+        try:
+            if not vol_df.empty and "등락률" in vol_df.columns:
+                loss_sorted = vol_df.nsmallest(10, "등락률")
+                for ticker_code in loss_sorted.index:
+                    name = krx.get_market_ticker_name(ticker_code)
+                    row = loss_sorted.loc[ticker_code]
+                    top_losers.append({
+                        "ticker": ticker_code,
+                        "name": name,
+                        "close": int(row["종가"]),
+                        "change_pct": round(float(row["등락률"]), 2),
+                        "volume": int(row["거래량"]),
+                    })
+        except Exception:
+            pass
+
+        # 투자자별 순매수
+        investor_data = {}
+        try:
+            inv = krx.get_market_trading_value_by_investor(recent_date, recent_date, "KOSPI")
+            if not inv.empty:
+                for label in ["외국인합계", "기관합계", "개인"]:
+                    if label in inv.index and "순매수" in inv.columns:
+                        investor_data[label.replace("합계", "")] = int(inv.loc[label, "순매수"])
+        except Exception:
+            pass
+
         return {
-            "date": today,
+            "date": recent_date,
             "kospi": kospi_result,
             "kosdaq": kosdaq_result,
-            "major_stocks": stocks,
+            "top_volume": top_volume,
+            "top_gainers": top_gainers,
+            "top_losers": top_losers,
             "investor_flow": investor_data,
         }
     except Exception as e:
@@ -102,7 +137,6 @@ async def get_us_market_data(days: int = 5):
 
         period = f"{max(days, 5)}d"
 
-        # 주요 지수
         indices = {"^GSPC": "S&P500", "^IXIC": "NASDAQ", "^DJI": "DOW"}
         index_data = {}
         for symbol, name in indices.items():
@@ -121,15 +155,10 @@ async def get_us_market_data(days: int = 5):
             except Exception:
                 continue
 
-        # 빅테크 종목
         tech_symbols = {
-            "AAPL": "Apple",
-            "MSFT": "Microsoft",
-            "NVDA": "NVIDIA",
-            "TSLA": "Tesla",
-            "GOOGL": "Google",
-            "AMZN": "Amazon",
-            "META": "Meta",
+            "AAPL": "Apple", "MSFT": "Microsoft", "NVDA": "NVIDIA",
+            "TSLA": "Tesla", "GOOGL": "Google", "AMZN": "Amazon",
+            "META": "Meta", "AMD": "AMD", "AVGO": "Broadcom",
         }
 
         stocks = {}
@@ -192,14 +221,12 @@ async def generate_chart(req: ChartRequest):
             ticker = yf.Ticker(req.symbol)
             df = ticker.history(period=f"{req.days}d")
 
-        # 필요한 컬럼만 남기기
         df = df[["Open", "High", "Low", "Close", "Volume"]]
         df = df.tail(req.days)
 
         if df.empty:
             raise HTTPException(status_code=404, detail="데이터 없음")
 
-        # 차트 스타일
         mc = mpf.make_marketcolors(
             up="red", down="blue", edge="inherit",
             wick="inherit", volume="in",
@@ -236,6 +263,8 @@ async def get_forex_data():
             "GC=F": "Gold",
             "CL=F": "WTI_Oil",
             "BTC-USD": "Bitcoin",
+            "^VIX": "VIX_공포지수",
+            "^TNX": "미국10년국채금리",
         }
 
         result = {}
@@ -259,11 +288,190 @@ async def get_forex_data():
 
 
 # ============================================================
-# 5. 통합 데이터 (n8n에서 한번에 호출)
+# 5. 뉴스 헤드라인 수집 (고정 키워드 기반)
+# ============================================================
+NEWS_KEYWORDS = [
+    "금리", "인플레이션", "반도체", "실적발표", "외국인 매수",
+    "AI 인공지능", "환율", "유가", "연준 Fed", "코스피",
+    "나스닥", "삼성전자", "SK하이닉스", "테슬라", "엔비디아",
+]
+
+
+@app.get("/api/news")
+async def get_news_headlines():
+    """고정 키워드 기반 뉴스 헤드라인 수집 (RSS/웹 크롤링)"""
+    import urllib.request
+    import xml.etree.ElementTree as ET
+    from urllib.parse import quote
+
+    all_news = []
+
+    for keyword in NEWS_KEYWORDS:
+        try:
+            encoded = quote(keyword)
+            url = f"https://news.google.com/rss/search?q={encoded}+when:1d&hl=ko&gl=KR&ceid=KR:ko"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                xml_data = resp.read()
+
+            root = ET.fromstring(xml_data)
+            items = root.findall(".//item")
+
+            for item in items[:3]:  # 키워드당 최대 3개
+                title = item.find("title")
+                pub_date = item.find("pubDate")
+                source = item.find("source")
+
+                if title is not None and title.text:
+                    all_news.append({
+                        "keyword": keyword,
+                        "headline": title.text.strip(),
+                        "source": source.text.strip() if source is not None and source.text else "",
+                        "date": pub_date.text.strip() if pub_date is not None and pub_date.text else "",
+                    })
+        except Exception:
+            continue
+
+    # 중복 헤드라인 제거
+    seen = set()
+    unique_news = []
+    for item in all_news:
+        if item["headline"] not in seen:
+            seen.add(item["headline"])
+            unique_news.append(item)
+
+    return {
+        "keywords_used": NEWS_KEYWORDS,
+        "total_headlines": len(unique_news),
+        "headlines": unique_news,
+    }
+
+
+# ============================================================
+# 6. 일일 피드 생성 (Markdown 텍스트 - 복사해서 LLM에 붙여넣기용)
+# ============================================================
+@app.get("/api/daily-feed", response_class=PlainTextResponse)
+async def get_daily_feed():
+    """모든 데이터를 수집하여 LLM 입력용 Markdown 텍스트로 병합"""
+    try:
+        kr = await get_kr_market_data()
+        us = await get_us_market_data()
+        forex = await get_forex_data()
+        news = await get_news_headlines()
+
+        today_str = datetime.now().strftime("%Y년 %m월 %d일 %H:%M")
+        lines = []
+
+        lines.append(f"# 일일 경제 브리핑 데이터 ({today_str} 기준)")
+        lines.append("")
+
+        # ── 미국 증시 ──
+        lines.append("## 1. 미국 증시 (간밤 마감)")
+        if us.get("indices"):
+            for name, data in us["indices"].items():
+                arrow = "▲" if data["change_pct"] > 0 else "▼" if data["change_pct"] < 0 else "─"
+                lines.append(f"- {name}: {data['close']:,.2f} ({arrow}{abs(data['change_pct'])}%)")
+        lines.append("")
+
+        if us.get("major_stocks"):
+            lines.append("### 미국 주요 종목")
+            for name, data in us["major_stocks"].items():
+                arrow = "▲" if data["change_pct"] > 0 else "▼" if data["change_pct"] < 0 else "─"
+                lines.append(f"- {name}({data['symbol']}): ${data['close']:,.2f} ({arrow}{abs(data['change_pct'])}%)")
+        lines.append("")
+
+        # ── 한국 증시 ──
+        lines.append("## 2. 한국 증시 (전일 마감)")
+        if kr.get("kospi"):
+            k = kr["kospi"]
+            arrow = "▲" if k["change_pct"] > 0 else "▼" if k["change_pct"] < 0 else "─"
+            lines.append(f"- KOSPI: {k['close']:,.2f} ({arrow}{abs(k['change_pct'])}%)")
+        if kr.get("kosdaq"):
+            k = kr["kosdaq"]
+            arrow = "▲" if k["change_pct"] > 0 else "▼" if k["change_pct"] < 0 else "─"
+            lines.append(f"- KOSDAQ: {k['close']:,.2f} ({arrow}{abs(k['change_pct'])}%)")
+        lines.append("")
+
+        if kr.get("investor_flow"):
+            lines.append("### 투자자별 순매수 (KOSPI)")
+            for inv, val in kr["investor_flow"].items():
+                arrow = "순매수" if val > 0 else "순매도"
+                lines.append(f"- {inv}: {abs(val):,}원 ({arrow})")
+            lines.append("")
+
+        if kr.get("top_gainers"):
+            lines.append("### 등락률 상위 (급등 종목)")
+            for s in kr["top_gainers"][:7]:
+                lines.append(f"- {s['name']}({s['ticker']}): {s['close']:,}원 (▲{abs(s['change_pct'])}%)")
+            lines.append("")
+
+        if kr.get("top_losers"):
+            lines.append("### 등락률 하위 (급락 종목)")
+            for s in kr["top_losers"][:7]:
+                lines.append(f"- {s['name']}({s['ticker']}): {s['close']:,}원 (▼{abs(s['change_pct'])}%)")
+            lines.append("")
+
+        if kr.get("top_volume"):
+            lines.append("### 거래대금 상위 (주목 종목)")
+            for s in kr["top_volume"][:7]:
+                arrow = "▲" if s["change_pct"] > 0 else "▼" if s["change_pct"] < 0 else "─"
+                lines.append(f"- {s['name']}({s['ticker']}): {s['close']:,}원 ({arrow}{abs(s['change_pct'])}%) 거래량:{s['volume']:,}")
+            lines.append("")
+
+        # ── 환율/원자재 ──
+        lines.append("## 3. 환율 및 주요 지표")
+        if forex:
+            for name, data in forex.items():
+                arrow = "▲" if data["change_pct"] > 0 else "▼" if data["change_pct"] < 0 else "─"
+                lines.append(f"- {name}: {data['price']:,.2f} ({arrow}{abs(data['change_pct'])}%)")
+        lines.append("")
+
+        # ── 뉴스 헤드라인 ──
+        lines.append("## 4. 핵심 뉴스 헤드라인 (최근 24시간)")
+        if news.get("headlines"):
+            current_keyword = ""
+            for item in news["headlines"]:
+                if item["keyword"] != current_keyword:
+                    current_keyword = item["keyword"]
+                    lines.append(f"\n### [{current_keyword}]")
+                source_str = f" ({item['source']})" if item["source"] else ""
+                lines.append(f"- {item['headline']}{source_str}")
+        lines.append("")
+
+        # ── 메가 프롬프트 안내 ──
+        lines.append("---")
+        lines.append("")
+        lines.append("## 위 데이터를 ChatGPT/Claude에 붙여넣을 때 사용할 프롬프트")
+        lines.append("")
+        lines.append('"""')
+        lines.append("너는 100만 구독자를 보유한 날카로운 경제 유튜브 채널의 메인 작가야.")
+        lines.append("아래에 제공된 [오늘의 수집 데이터]를 분석해서 다음 3가지 작업을 순서대로 수행해줘.")
+        lines.append("")
+        lines.append("1. 주제 선정: 제공된 뉴스 헤드라인과 한미 증시 데이터를 교차 분석하여,")
+        lines.append("   오늘 한국 주식 투자자들이 가장 주목해야 할 핵심 메인 테마 1가지를 도출해.")
+        lines.append("   (예: 미국 빅테크 실적이 국내 소부장 주가에 미치는 영향)")
+        lines.append("")
+        lines.append("2. 논리 구조화: 도출된 테마를 바탕으로")
+        lines.append("   [오프닝 훅] - [거시 경제 상황] - [관련 국내 종목 분석] - [마무리 요약]")
+        lines.append("   의 4단계 구조를 짜줘.")
+        lines.append("")
+        lines.append("3. 대본 및 시각 자료 작성: 위 구조를 바탕으로 실제 유튜브 더빙에 사용할 구어체 대본을 작성해.")
+        lines.append("   단, 영상 편집을 위해 각 씬(Scene)마다 화면에 띄울 '이미지 생성 프롬프트")
+        lines.append("   (또는 B-roll 지시사항)'와 '자막'을 JSON 형태로 함께 묶어서 출력해.")
+        lines.append('"""')
+        lines.append("")
+
+        return "\n".join(lines)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# 7. 통합 JSON 데이터 (기존 호환)
 # ============================================================
 @app.get("/api/daily-briefing")
 async def get_daily_briefing():
-    """한국+미국 증시 + 환율 통합 데이터 (n8n 워크플로우 메인 엔드포인트)"""
+    """한국+미국 증시 + 환율 통합 JSON 데이터"""
     try:
         kr = await get_kr_market_data()
         us = await get_us_market_data()
@@ -285,51 +493,3 @@ async def get_daily_briefing():
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
-
-
-@app.get("/api/debug")
-async def debug():
-    """디버그: 라이브러리 버전 및 기본 데이터 테스트"""
-    import traceback
-    result = {"versions": {}, "tests": {}}
-
-    try:
-        import pykrx
-        result["versions"]["pykrx"] = pykrx.__version__ if hasattr(pykrx, '__version__') else "installed"
-    except Exception as e:
-        result["versions"]["pykrx"] = f"ERROR: {e}"
-
-    try:
-        import yfinance as yf
-        result["versions"]["yfinance"] = yf.__version__
-    except Exception as e:
-        result["versions"]["yfinance"] = f"ERROR: {e}"
-
-    # pykrx 테스트
-    try:
-        from pykrx import stock as krx
-        today = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d")
-        kospi = krx.get_index_ohlcv(start, today, "1001")
-        result["tests"]["pykrx_kospi"] = {
-            "columns": kospi.columns.tolist(),
-            "rows": len(kospi),
-            "last_row": {col: str(kospi.iloc[-1][col]) for col in kospi.columns} if not kospi.empty else None,
-        }
-    except Exception as e:
-        result["tests"]["pykrx_kospi"] = f"ERROR: {traceback.format_exc()}"
-
-    # yfinance 테스트
-    try:
-        import yfinance as yf
-        ticker = yf.Ticker("^GSPC")
-        hist = ticker.history(period="5d")
-        result["tests"]["yfinance_sp500"] = {
-            "columns": hist.columns.tolist(),
-            "rows": len(hist),
-            "last_row": {col: str(hist.iloc[-1][col]) for col in hist.columns} if not hist.empty else None,
-        }
-    except Exception as e:
-        result["tests"]["yfinance_sp500"] = f"ERROR: {traceback.format_exc()}"
-
-    return result
