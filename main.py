@@ -285,3 +285,51 @@ async def get_daily_briefing():
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+
+@app.get("/api/debug")
+async def debug():
+    """디버그: 라이브러리 버전 및 기본 데이터 테스트"""
+    import traceback
+    result = {"versions": {}, "tests": {}}
+
+    try:
+        import pykrx
+        result["versions"]["pykrx"] = pykrx.__version__ if hasattr(pykrx, '__version__') else "installed"
+    except Exception as e:
+        result["versions"]["pykrx"] = f"ERROR: {e}"
+
+    try:
+        import yfinance as yf
+        result["versions"]["yfinance"] = yf.__version__
+    except Exception as e:
+        result["versions"]["yfinance"] = f"ERROR: {e}"
+
+    # pykrx 테스트
+    try:
+        from pykrx import stock as krx
+        today = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d")
+        kospi = krx.get_index_ohlcv(start, today, "1001")
+        result["tests"]["pykrx_kospi"] = {
+            "columns": kospi.columns.tolist(),
+            "rows": len(kospi),
+            "last_row": {col: str(kospi.iloc[-1][col]) for col in kospi.columns} if not kospi.empty else None,
+        }
+    except Exception as e:
+        result["tests"]["pykrx_kospi"] = f"ERROR: {traceback.format_exc()}"
+
+    # yfinance 테스트
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker("^GSPC")
+        hist = ticker.history(period="5d")
+        result["tests"]["yfinance_sp500"] = {
+            "columns": hist.columns.tolist(),
+            "rows": len(hist),
+            "last_row": {col: str(hist.iloc[-1][col]) for col in hist.columns} if not hist.empty else None,
+        }
+    except Exception as e:
+        result["tests"]["yfinance_sp500"] = f"ERROR: {traceback.format_exc()}"
+
+    return result
