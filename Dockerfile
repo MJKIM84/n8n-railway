@@ -1,16 +1,6 @@
-FROM n8nio/n8n:latest
+FROM python:3.11-slim AS python-base
 
-USER root
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    python3-venv \
-    gcc \
-    libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip3 install --break-system-packages \
+RUN pip install --no-cache-dir \
     pykrx \
     finance-datareader \
     yfinance \
@@ -19,6 +9,16 @@ RUN pip3 install --break-system-packages \
     pandas \
     numpy \
     requests
+
+FROM n8nio/n8n:latest
+
+USER root
+
+COPY --from=python-base /usr/local/lib/python3.11 /usr/local/lib/python3.11
+COPY --from=python-base /usr/local/bin/python3.11 /usr/local/bin/python3.11
+COPY --from=python-base /usr/local/bin/python3 /usr/local/bin/python3
+
+RUN ln -sf /usr/local/bin/python3.11 /usr/bin/python3
 
 USER node
 
