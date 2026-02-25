@@ -1,24 +1,17 @@
-FROM python:3.11-slim AS python-builder
+FROM python:3.11-slim
 
-RUN pip install --no-cache-dir \
-    pykrx \
-    finance-datareader \
-    yfinance \
-    mplfinance \
-    matplotlib \
-    pandas \
-    numpy \
-    requests
+WORKDIR /app
 
-FROM n8nio/n8n:latest
+# matplotlib 렌더링용 시스템 의존성
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
 
-USER root
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Python 바이너리와 라이브러리 복사
-COPY --from=python-builder /usr/local/lib/python3.11 /usr/local/lib/python3.11
-COPY --from=python-builder /usr/local/bin/python3.11 /usr/local/bin/python3.11
-COPY --from=python-builder /usr/local/lib/libpython3.11.so* /usr/local/lib/
-COPY --from=python-builder /usr/local/include/python3.11 /usr/local/include/python3.11
+COPY . .
 
-RUN ln -sf /usr/local/bin/python3.11 /usr/local/bin/python3 && \
-    ln -sf /usr/local/bin/p
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
