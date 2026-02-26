@@ -478,28 +478,27 @@ async def get_seeking_alpha_data():
     ratings = []
     for symbol in SA_SYMBOLS:
         data = _sa_get("/symbols/get-ratings", {"symbol": symbol})
-        if data and "data" in data:
+        if data and "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
             try:
-                attrs = data["data"][0]["attributes"] if isinstance(data["data"], list) else data["data"].get("attributes", {})
+                r = data["data"][0].get("attributes", {}).get("ratings", {})
                 ratings.append({
                     "symbol": symbol,
-                    "analysts_rating": attrs.get("sellSideRating", ""),
-                    "quant_rating": attrs.get("quantRating", ""),
-                    "authors_rating": attrs.get("authorsRatingPro", attrs.get("authorsRating", "")),
+                    "wall_street": round(r.get("sellSideRating", 0), 2) if r.get("sellSideRating") else "",
+                    "quant": round(r.get("quantRating", 0), 2) if r.get("quantRating") else "",
+                    "authors": round(r.get("authorsRating", 0), 2) if r.get("authorsRating") else "",
                 })
             except (KeyError, IndexError):
                 continue
 
-    # 2) 트렌딩 분석 기사
+    # 2) 트렌딩 마켓 뉴스
     trending = []
-    data = _sa_get("/analysis/v2/list", {"category": "latest", "size": 10})
+    data = _sa_get("/news/v2/list", {"category": "market-news::all", "size": 10})
     if data and "data" in data:
         for article in data["data"][:10]:
             try:
                 attrs = article.get("attributes", {})
                 trending.append({
                     "title": attrs.get("title", ""),
-                    "summary": (attrs.get("summary", "") or attrs.get("teaser", ""))[:200],
                     "publish_on": attrs.get("publishOn", ""),
                 })
             except (KeyError, IndexError):
@@ -629,20 +628,20 @@ async def get_daily_feed():
             lines.append("## 6. 애널리스트 레이팅 (Seeking Alpha)")
             for r in sa["ratings"]:
                 parts = [f"**{r['symbol']}**"]
-                if r.get("analysts_rating"):
-                    parts.append(f"월가: {r['analysts_rating']:.2f}" if isinstance(r["analysts_rating"], (int, float)) else f"월가: {r['analysts_rating']}")
-                if r.get("quant_rating"):
-                    parts.append(f"퀀트: {r['quant_rating']:.2f}" if isinstance(r["quant_rating"], (int, float)) else f"퀀트: {r['quant_rating']}")
+                if r.get("wall_street"):
+                    parts.append(f"월가: {r['wall_street']}")
+                if r.get("quant"):
+                    parts.append(f"퀀트: {r['quant']}")
+                if r.get("authors"):
+                    parts.append(f"SA분석가: {r['authors']}")
                 lines.append(f"- {' | '.join(parts)}")
             lines.append("- (1=Strong Sell, 3=Hold, 5=Strong Buy)")
             lines.append("")
 
         if sa.get("trending"):
-            lines.append("## 7. 트렌딩 분석 (Seeking Alpha)")
+            lines.append("## 7. 마켓 뉴스 (Seeking Alpha)")
             for article in sa["trending"]:
-                lines.append(f"- **{article['title']}**")
-                if article.get("summary"):
-                    lines.append(f"  > {article['summary']}")
+                lines.append(f"- {article['title']}")
             lines.append("")
 
         return "\n".join(lines)
