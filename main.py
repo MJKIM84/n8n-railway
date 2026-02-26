@@ -9,6 +9,7 @@ import os
 app = FastAPI(title="YouTube Automation - Stock Data API")
 
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
 
 
 # ============================================================
@@ -438,6 +439,79 @@ async def get_tavily_news():
 
 
 # ============================================================
+# 5-3. Seeking Alpha 데이터 (RapidAPI)
+# ============================================================
+SA_SYMBOLS = ["NVDA", "AAPL", "MSFT", "TSLA", "GOOGL", "AMZN", "META", "AMD", "AVGO"]
+
+RAPIDAPI_HEADERS = {
+    "x-rapidapi-host": "seeking-alpha.p.rapidapi.com",
+}
+
+
+def _sa_get(endpoint: str, params: dict = None) -> dict | None:
+    """Seeking Alpha API 호출 헬퍼"""
+    if not RAPIDAPI_KEY:
+        return None
+    import requests
+    headers = {**RAPIDAPI_HEADERS, "x-rapidapi-key": RAPIDAPI_KEY}
+    try:
+        resp = requests.get(
+            f"https://seeking-alpha.p.rapidapi.com{endpoint}",
+            headers=headers,
+            params=params or {},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+
+@app.get("/api/seeking-alpha")
+async def get_seeking_alpha_data():
+    """Seeking Alpha: 애널리스트 레이팅 + 실적 캘린더 + 인기 분석"""
+    if not RAPIDAPI_KEY:
+        return {"error": "RAPIDAPI_KEY not set", "ratings": [], "trending": []}
+
+    # 1) 주요 종목 애널리스트 레이팅
+    ratings = []
+    for symbol in SA_SYMBOLS:
+        data = _sa_get("/symbols/get-ratings", {"symbol": symbol})
+        if data and "data" in data:
+            try:
+                attrs = data["data"][0]["attributes"] if isinstance(data["data"], list) else data["data"].get("attributes", {})
+                ratings.append({
+                    "symbol": symbol,
+                    "analysts_rating": attrs.get("sellSideRating", ""),
+                    "quant_rating": attrs.get("quantRating", ""),
+                    "authors_rating": attrs.get("authorsRatingPro", attrs.get("authorsRating", "")),
+                })
+            except (KeyError, IndexError):
+                continue
+
+    # 2) 트렌딩 분석 기사
+    trending = []
+    data = _sa_get("/analysis/v2/list", {"category": "latest", "size": 10})
+    if data and "data" in data:
+        for article in data["data"][:10]:
+            try:
+                attrs = article.get("attributes", {})
+                trending.append({
+                    "title": attrs.get("title", ""),
+                    "summary": (attrs.get("summary", "") or attrs.get("teaser", ""))[:200],
+                    "publish_on": attrs.get("publishOn", ""),
+                })
+            except (KeyError, IndexError):
+                continue
+
+    return {
+        "ratings": ratings,
+        "trending": trending,
+    }
+
+
+# ============================================================
 # 6. 일일 피드 생성 (Markdown 텍스트 - 복사해서 LLM에 붙여넣기용)
 # ============================================================
 @app.get("/api/daily-feed", response_class=PlainTextResponse)
@@ -449,6 +523,7 @@ async def get_daily_feed():
         forex = await get_forex_data()
         news = await get_news_headlines()
         tavily = await get_tavily_news()
+        sa = await get_seeking_alpha_data()
 
         today_str = datetime.now().strftime("%Y년 %m월 %d일 %H:%M")
         lines = []
@@ -547,6 +622,27 @@ async def get_daily_feed():
                 lines.append(f"- **{item['title']}**")
                 if item.get("content"):
                     lines.append(f"  > {item['content'][:300]}")
+            lines.append("")
+
+        # ── Seeking Alpha 애널리스트 데이터 ──
+        if sa.get("ratings"):
+            lines.append("## 6. 애널리스트 레이팅 (Seeking Alpha)")
+            for r in sa["ratings"]:
+                parts = [f"**{r['symbol']}**"]
+                if r.get("analysts_rating"):
+                    parts.append(f"월가: {r['analysts_rating']:.2f}" if isinstance(r["analysts_rating"], (int, float)) else f"월가: {r['analysts_rating']}")
+                if r.get("quant_rating"):
+                    parts.append(f"퀀트: {r['quant_rating']:.2f}" if isinstance(r["quant_rating"], (int, float)) else f"퀀트: {r['quant_rating']}")
+                lines.append(f"- {' | '.join(parts)}")
+            lines.append("- (1=Strong Sell, 3=Hold, 5=Strong Buy)")
+            lines.append("")
+
+        if sa.get("trending"):
+            lines.append("## 7. 트렌딩 분석 (Seeking Alpha)")
+            for article in sa["trending"]:
+                lines.append(f"- **{article['title']}**")
+                if article.get("summary"):
+                    lines.append(f"  > {article['summary']}")
             lines.append("")
 
         return "\n".join(lines)
