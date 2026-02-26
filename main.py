@@ -8,6 +8,8 @@ import os
 
 app = FastAPI(title="YouTube Automation - Stock Data API")
 
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+
 
 # ============================================================
 # 1. 한국 증시 데이터 수집 (pykrx)
@@ -380,6 +382,62 @@ async def get_news_headlines():
 
 
 # ============================================================
+# 5-2. Tavily 심층 뉴스 검색
+# ============================================================
+TAVILY_KEYWORDS = [
+    "한국 증시 코스피 오늘",
+    "미국 증시 나스닥 S&P500",
+    "반도체 AI 엔비디아 SK하이닉스",
+    "환율 원달러 금리 연준",
+    "삼성전자 테슬라 실적",
+]
+
+
+@app.get("/api/tavily-news")
+async def get_tavily_news():
+    """Tavily Search API로 심층 뉴스 수집 (본문 요약 포함)"""
+    if not TAVILY_API_KEY:
+        return {"error": "TAVILY_API_KEY not set", "results": []}
+
+    try:
+        from tavily import TavilyClient
+
+        client = TavilyClient(api_key=TAVILY_API_KEY)
+        all_results = []
+        seen_urls = set()
+
+        for keyword in TAVILY_KEYWORDS:
+            try:
+                response = client.search(
+                    query=keyword,
+                    search_depth="basic",
+                    topic="news",
+                    days=1,
+                    max_results=5,
+                    include_answer=False,
+                )
+                for r in response.get("results", []):
+                    if r["url"] not in seen_urls:
+                        seen_urls.add(r["url"])
+                        all_results.append({
+                            "keyword": keyword,
+                            "title": r.get("title", ""),
+                            "content": r.get("content", ""),
+                            "url": r.get("url", ""),
+                        })
+            except Exception:
+                continue
+
+        return {
+            "keywords_used": TAVILY_KEYWORDS,
+            "total_results": len(all_results),
+            "results": all_results,
+        }
+    except Exception as e:
+        return {"error": str(e), "results": []}
+
+
+# ============================================================
 # 6. 일일 피드 생성 (Markdown 텍스트 - 복사해서 LLM에 붙여넣기용)
 # ============================================================
 @app.get("/api/daily-feed", response_class=PlainTextResponse)
@@ -390,6 +448,7 @@ async def get_daily_feed():
         us = await get_us_market_data()
         forex = await get_forex_data()
         news = await get_news_headlines()
+        tavily = await get_tavily_news()
 
         today_str = datetime.now().strftime("%Y년 %m월 %d일 %H:%M")
         lines = []
@@ -465,7 +524,7 @@ async def get_daily_feed():
                 lines.append(f"- {name}: {data['price']:,.2f} ({arrow}{abs(data['change_pct'])}%)")
         lines.append("")
 
-        # ── 뉴스 헤드라인 ──
+        # ── 뉴스 헤드라인 (Google News RSS) ──
         lines.append("## 4. 핵심 뉴스 헤드라인 (최근 24시간)")
         if news.get("headlines"):
             current_keyword = ""
@@ -476,6 +535,19 @@ async def get_daily_feed():
                 source_str = f" ({item['source']})" if item["source"] else ""
                 lines.append(f"- {item['headline']}{source_str}")
         lines.append("")
+
+        # ── Tavily 심층 뉴스 ──
+        if tavily.get("results"):
+            lines.append("## 5. 심층 뉴스 분석 (Tavily)")
+            current_keyword = ""
+            for item in tavily["results"]:
+                if item["keyword"] != current_keyword:
+                    current_keyword = item["keyword"]
+                    lines.append(f"\n### [{current_keyword}]")
+                lines.append(f"- **{item['title']}**")
+                if item.get("content"):
+                    lines.append(f"  > {item['content'][:300]}")
+            lines.append("")
 
         return "\n".join(lines)
     except Exception as e:
