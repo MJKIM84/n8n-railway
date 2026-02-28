@@ -10,6 +10,38 @@ app = FastAPI(title="YouTube Automation - Stock Data API")
 
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# 기존 고정 종목 목록 (헤드라인 추출 비교용)
+US_FIXED_TICKERS = {"AAPL", "MSFT", "NVDA", "TSLA", "GOOGL", "AMZN", "META", "AMD", "AVGO"}
+KR_FIXED_NAMES = {
+    "삼성전자", "SK하이닉스", "LG에너지솔루션", "현대차", "NAVER",
+    "카카오", "삼성SDI", "삼성바이오로직스", "셀트리온", "POSCO홀딩스",
+}
+
+# 한국 주요 기업명 → 티커 코드 매핑 (헤드라인 추출 기업 데이터 조회용)
+KR_NAME_TO_TICKER = {
+    "삼성전자": "005930", "SK하이닉스": "000660", "LG에너지솔루션": "373220",
+    "현대차": "005380", "현대자동차": "005380", "NAVER": "035420", "네이버": "035420",
+    "카카오": "035720", "삼성SDI": "006400", "삼성바이오로직스": "207940",
+    "셀트리온": "068270", "POSCO홀딩스": "005490", "포스코홀딩스": "005490",
+    "KB금융": "105560", "신한지주": "055550", "하나금융지주": "086790",
+    "우리금융지주": "316140", "기아": "000270", "현대모비스": "012330",
+    "LG화학": "051910", "LG전자": "066570", "삼성물산": "028260",
+    "두산에너빌리티": "034020", "HD현대중공업": "329180", "한화에어로스페이스": "012450",
+    "두산밥캣": "241560", "에코프로": "086520", "에코프로비엠": "247540",
+    "포스코퓨처엠": "003670", "HMM": "011200", "대한항공": "003490",
+    "SK이노베이션": "096770", "SK텔레콤": "017670", "KT": "030200",
+    "LG유플러스": "032640", "현대글로비스": "086280", "삼성SDS": "018260",
+    "롯데케미칼": "011170", "한국전력": "015760", "CJ제일제당": "097950",
+    "아모레퍼시픽": "090430", "LG생활건강": "051900", "엔씨소프트": "036570",
+    "크래프톤": "259960", "넷마블": "251270", "카카오뱅크": "323410",
+    "카카오페이": "377300", "HD현대": "267250", "한화오션": "042660",
+    "한국항공우주": "047810", "현대건설": "000720", "삼성엔지니어링": "028050",
+    "SK바이오팜": "326030", "유한양행": "000100", "셀트리온헬스케어": "091990",
+    "GS건설": "006360", "현대제철": "004020", "OCI홀딩스": "456040",
+    "한화솔루션": "009830", "롯데에너지머티리얼즈": "020150",
+}
 
 
 # ============================================================
@@ -511,24 +543,246 @@ async def get_seeking_alpha_data():
 
 
 # ============================================================
+# 6-0. 헤드라인 기반 동적 기업 추출 헬퍼 함수들
+# ============================================================
+async def extract_companies_from_headlines(headlines: list) -> dict:
+    """Claude Haiku로 헤드라인에서 고정 목록에 없는 신규 기업 추출"""
+    if not ANTHROPIC_API_KEY or not headlines:
+        return {"us_tickers": [], "kr_companies": []}
+
+    headline_text = "\n".join([f"- {item['headline']}" for item in headlines[:60]])
+    fixed_us = ", ".join(sorted(US_FIXED_TICKERS))
+    fixed_kr = ", ".join(sorted(KR_FIXED_NAMES))
+
+    prompt = f"""다음 뉴스 헤드라인에서 언급된 기업들을 추출해줘.
+
+헤드라인:
+{headline_text}
+
+아래 JSON 형식으로만 응답해줘 (설명 없이):
+{{
+  "us_tickers": ["TICKER1", "TICKER2"],
+  "kr_companies": ["회사명1", "회사명2"]
+}}
+
+규칙:
+- 미국 기업은 주식 티커 심볼로 표시 (대문자, 예: PLTR, SMCI, INTC, ARM)
+- 한국 기업은 공식 한글 회사명으로 표시 (예: 두산에너빌리티, 한화에어로스페이스)
+- 지수(S&P500, 코스피 등), 국가, 섹터명은 제외
+- 명확히 언급된 기업만 포함 (추측 금지)
+- 아래 이미 처리되는 기업은 제외:
+  미국: {fixed_us}
+  한국: {fixed_kr}"""
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+        # 코드블록 제거
+        if "```" in text:
+            parts = text.split("```")
+            text = parts[1] if len(parts) > 1 else text
+            if text.startswith("json"):
+                text = text[4:]
+        result = json.loads(text)
+        return {
+            "us_tickers": [t for t in result.get("us_tickers", []) if t not in US_FIXED_TICKERS],
+            "kr_companies": [c for c in result.get("kr_companies", []) if c not in KR_FIXED_NAMES],
+        }
+    except Exception:
+        return {"us_tickers": [], "kr_companies": []}
+
+
+async def fetch_extra_us_stocks(tickers: list) -> dict:
+    """헤드라인 추출 추가 미국 종목 주가 수집 (최대 5개)"""
+    if not tickers:
+        return {}
+    import yfinance as yf
+
+    stocks = {}
+    for symbol in tickers[:5]:
+        try:
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="5d")
+            if not hist.empty and len(hist) > 1:
+                latest = hist.iloc[-1]
+                prev = hist.iloc[-2]
+                try:
+                    name = ticker.fast_info.company_name or symbol
+                except Exception:
+                    name = symbol
+                stocks[name] = {
+                    "symbol": symbol,
+                    "close": round(float(latest["Close"]), 2),
+                    "prev_close": round(float(prev["Close"]), 2),
+                    "change_pct": round(((float(latest["Close"]) / float(prev["Close"])) - 1) * 100, 2),
+                    "volume": int(latest["Volume"]),
+                }
+        except Exception:
+            continue
+    return stocks
+
+
+async def fetch_extra_kr_stocks(company_names: list) -> dict:
+    """헤드라인 추출 추가 한국 종목 주가 수집 (최대 5개, KR_NAME_TO_TICKER 기반)"""
+    if not company_names:
+        return {}
+    from pykrx import stock as krx
+
+    end = datetime.now().strftime("%Y%m%d")
+    start = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d")
+
+    stocks = {}
+    for name in company_names[:5]:
+        ticker_code = KR_NAME_TO_TICKER.get(name)
+        if not ticker_code:
+            continue
+        try:
+            df = krx.get_market_ohlcv(start, end, ticker_code)
+            if df is not None and not df.empty and len(df) >= 1:
+                row = df.iloc[-1]
+                prev_row = df.iloc[-2] if len(df) > 1 else row
+                change_pct = (
+                    round(((float(row["종가"]) / float(prev_row["종가"])) - 1) * 100, 2)
+                    if len(df) > 1 else 0
+                )
+                stocks[name] = {
+                    "ticker": ticker_code,
+                    "close": int(row["종가"]),
+                    "change_pct": change_pct,
+                    "volume": int(row["거래량"]),
+                }
+        except Exception:
+            continue
+    return stocks
+
+
+async def fetch_extra_tavily(names: list) -> list:
+    """헤드라인 추출 기업들의 Tavily 뉴스 추가 수집 (최대 3개 기업)"""
+    if not names or not TAVILY_API_KEY:
+        return []
+    try:
+        from tavily import TavilyClient
+        client = TavilyClient(api_key=TAVILY_API_KEY)
+        results = []
+        for name in names[:3]:
+            try:
+                response = client.search(
+                    query=f"{name} 주가 뉴스 최신",
+                    search_depth="basic",
+                    topic="news",
+                    days=2,
+                    max_results=3,
+                    include_answer=False,
+                )
+                for r in response.get("results", []):
+                    results.append({
+                        "keyword": f"[추출기업] {name}",
+                        "title": r.get("title", ""),
+                        "content": r.get("content", ""),
+                        "url": r.get("url", ""),
+                    })
+            except Exception:
+                continue
+        return results
+    except Exception:
+        return []
+
+
+async def fetch_extra_sa_ratings(tickers: list) -> list:
+    """헤드라인 추출 미국 종목 Seeking Alpha 레이팅 (최대 3개)"""
+    if not tickers or not RAPIDAPI_KEY:
+        return []
+    ratings = []
+    for symbol in tickers[:3]:
+        data = _sa_get("/symbols/get-ratings", {"symbol": symbol})
+        if data and "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+            try:
+                r = data["data"][0].get("attributes", {}).get("ratings", {})
+                ratings.append({
+                    "symbol": symbol,
+                    "wall_street": round(r.get("sellSideRating", 0), 2) if r.get("sellSideRating") else "",
+                    "quant": round(r.get("quantRating", 0), 2) if r.get("quantRating") else "",
+                    "authors": round(r.get("authorsRating", 0), 2) if r.get("authorsRating") else "",
+                })
+            except Exception:
+                continue
+    return ratings
+
+
+# ============================================================
 # 6. 일일 피드 생성 (Markdown 텍스트 - 복사해서 LLM에 붙여넣기용)
 # ============================================================
 @app.get("/api/daily-feed", response_class=PlainTextResponse)
 async def get_daily_feed():
     """모든 데이터를 수집하여 LLM 입력용 Markdown 텍스트로 병합"""
-    try:
-        kr = await get_kr_market_data()
-        us = await get_us_market_data()
-        forex = await get_forex_data()
-        news = await get_news_headlines()
-        tavily = await get_tavily_news()
-        sa = await get_seeking_alpha_data()
+    import asyncio
 
+    try:
+        # ── STEP 1: 뉴스 헤드라인 먼저 수집 ──
+        news = await get_news_headlines()
+
+        # ── STEP 2: Haiku 기업 추출 + 기존 데이터 병렬 수집 ──
+        (
+            extra_companies,
+            kr, us, forex, tavily, sa,
+        ) = await asyncio.gather(
+            extract_companies_from_headlines(news.get("headlines", [])),
+            get_kr_market_data(),
+            get_us_market_data(),
+            get_forex_data(),
+            get_tavily_news(),
+            get_seeking_alpha_data(),
+            return_exceptions=True,
+        )
+
+        # 예외 처리 (각 수집 실패 시 빈 값으로 폴백)
+        if isinstance(extra_companies, Exception): extra_companies = {"us_tickers": [], "kr_companies": []}
+        if isinstance(kr, Exception): kr = {}
+        if isinstance(us, Exception): us = {}
+        if isinstance(forex, Exception): forex = {}
+        if isinstance(tavily, Exception): tavily = {"results": []}
+        if isinstance(sa, Exception): sa = {"ratings": [], "trending": []}
+
+        extra_us_tickers = extra_companies.get("us_tickers", [])
+        extra_kr_names = extra_companies.get("kr_companies", [])
+        all_extra_names = extra_us_tickers + extra_kr_names
+
+        # ── STEP 3: 추가 기업 데이터 병렬 수집 ──
+        (
+            extra_us_stocks,
+            extra_kr_stocks,
+            extra_tavily_results,
+            extra_sa_ratings,
+        ) = await asyncio.gather(
+            fetch_extra_us_stocks(extra_us_tickers),
+            fetch_extra_kr_stocks(extra_kr_names),
+            fetch_extra_tavily(all_extra_names),
+            fetch_extra_sa_ratings(extra_us_tickers),
+            return_exceptions=True,
+        )
+
+        if isinstance(extra_us_stocks, Exception): extra_us_stocks = {}
+        if isinstance(extra_kr_stocks, Exception): extra_kr_stocks = {}
+        if isinstance(extra_tavily_results, Exception): extra_tavily_results = []
+        if isinstance(extra_sa_ratings, Exception): extra_sa_ratings = []
+
+        # ── STEP 4: Markdown 생성 ──
         today_str = datetime.now().strftime("%Y년 %m월 %d일 %H:%M")
         lines = []
 
         lines.append(f"# 일일 경제 브리핑 데이터 ({today_str} 기준)")
         lines.append("")
+
+        # 헤드라인 추출 기업 요약 (상단 노출)
+        if all_extra_names:
+            lines.append(f"> 💡 헤드라인에서 추출된 추가 기업: {', '.join(all_extra_names)}")
+            lines.append("")
 
         # ── 미국 증시 ──
         lines.append("## 1. 미국 증시 (간밤 마감)")
@@ -545,6 +799,13 @@ async def get_daily_feed():
                 lines.append(f"- {name}({data['symbol']}): ${data['close']:,.2f} ({arrow}{abs(data['change_pct'])}%)")
         lines.append("")
 
+        if extra_us_stocks:
+            lines.append("### 헤드라인 언급 추가 미국 종목")
+            for name, data in extra_us_stocks.items():
+                arrow = "▲" if data["change_pct"] > 0 else "▼" if data["change_pct"] < 0 else "─"
+                lines.append(f"- {name}({data['symbol']}): ${data['close']:,.2f} ({arrow}{abs(data['change_pct'])}%)")
+            lines.append("")
+
         # ── 한국 증시 ──
         lines.append("## 2. 한국 증시 (전일 마감)")
         if kr.get("kospi"):
@@ -560,6 +821,13 @@ async def get_daily_feed():
         if kr.get("major_stocks"):
             lines.append("### 한국 주요 대형주")
             for name, data in kr["major_stocks"].items():
+                arrow = "▲" if data["change_pct"] > 0 else "▼" if data["change_pct"] < 0 else "─"
+                lines.append(f"- {name}({data['ticker']}): {data['close']:,}원 ({arrow}{abs(data['change_pct'])}%)")
+            lines.append("")
+
+        if extra_kr_stocks:
+            lines.append("### 헤드라인 언급 추가 한국 종목")
+            for name, data in extra_kr_stocks.items():
                 arrow = "▲" if data["change_pct"] > 0 else "▼" if data["change_pct"] < 0 else "─"
                 lines.append(f"- {name}({data['ticker']}): {data['close']:,}원 ({arrow}{abs(data['change_pct'])}%)")
             lines.append("")
@@ -610,11 +878,12 @@ async def get_daily_feed():
                 lines.append(f"- {item['headline']}{source_str}")
         lines.append("")
 
-        # ── Tavily 심층 뉴스 ──
-        if tavily.get("results"):
+        # ── Tavily 심층 뉴스 (고정 + 추가 기업) ──
+        all_tavily_results = list(tavily.get("results", [])) + list(extra_tavily_results)
+        if all_tavily_results:
             lines.append("## 5. 심층 뉴스 분석 (Tavily)")
             current_keyword = ""
-            for item in tavily["results"]:
+            for item in all_tavily_results:
                 if item["keyword"] != current_keyword:
                     current_keyword = item["keyword"]
                     lines.append(f"\n### [{current_keyword}]")
@@ -623,10 +892,11 @@ async def get_daily_feed():
                     lines.append(f"  > {item['content'][:300]}")
             lines.append("")
 
-        # ── Seeking Alpha 애널리스트 데이터 ──
-        if sa.get("ratings"):
+        # ── Seeking Alpha 애널리스트 데이터 (고정 + 추가 종목) ──
+        all_ratings = list(sa.get("ratings", [])) + list(extra_sa_ratings)
+        if all_ratings:
             lines.append("## 6. 애널리스트 레이팅 (Seeking Alpha)")
-            for r in sa["ratings"]:
+            for r in all_ratings:
                 parts = [f"**{r['symbol']}**"]
                 if r.get("wall_street"):
                     parts.append(f"월가: {r['wall_street']}")
