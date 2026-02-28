@@ -47,6 +47,27 @@ KR_NAME_TO_TICKER = {
 # ============================================================
 # 1. 한국 증시 데이터 수집 (pykrx)
 # ============================================================
+def _patch_pykrx_index_name():
+    """pykrx가 야간에 KRX 지수명 API 빈 응답을 받아 크래시하는 버그 패치.
+    OHLCV 데이터는 정상 수집되므로 지수명 조회 실패만 무시하면 됨."""
+    try:
+        import pykrx.stock.stock_api as _sa
+        if getattr(_sa, "_index_name_patched", False):
+            return
+        _orig = _sa.get_index_ticker_name
+        def _safe_get_index_ticker_name(ticker):
+            try:
+                return _orig(ticker)
+            except Exception:
+                return ticker  # 실패 시 티커 코드 자체를 이름으로 사용
+        _sa.get_index_ticker_name = _safe_get_index_ticker_name
+        _sa._index_name_patched = True
+    except Exception:
+        pass
+
+_patch_pykrx_index_name()
+
+
 @app.get("/api/kr-market")
 async def get_kr_market_data(days: int = 5):
     """한국 증시 데이터 (KOSPI/KOSDAQ 지수 + 주요 종목 + 거래대금/등락률 상위)"""
