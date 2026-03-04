@@ -941,7 +941,87 @@ async def get_daily_feed():
 
 
 # ============================================================
-# 7. 통합 JSON 데이터 (기존 호환)
+# 7. 주제 기반 Google News + Seeking Alpha 리서치
+# ============================================================
+@app.get("/api/topic-research")
+async def get_topic_research(topic: str = "", topic_en: str = "", tickers: str = ""):
+    """특정주제용: topic 기반 Google News(한/영) + Seeking Alpha 레이팅"""
+    import urllib.request
+    import xml.etree.ElementTree as ET
+    from urllib.parse import quote
+
+    result = {
+        "google_news_kr": [],
+        "google_news_en": [],
+        "seeking_alpha_ratings": [],
+    }
+
+    # Google News 한국어 (topic 기반, 최근 3일)
+    if topic:
+        try:
+            encoded = quote(topic)
+            url = f"https://news.google.com/rss/search?q={encoded}+when:3d&hl=ko&gl=KR&ceid=KR:ko"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                xml_data = resp.read()
+            root = ET.fromstring(xml_data)
+            for item in root.findall(".//item")[:10]:
+                title = item.find("title")
+                source = item.find("source")
+                pub_date = item.find("pubDate")
+                if title is not None and title.text:
+                    result["google_news_kr"].append({
+                        "headline": title.text.strip(),
+                        "source": source.text.strip() if source is not None and source.text else "",
+                        "date": pub_date.text.strip() if pub_date is not None and pub_date.text else "",
+                    })
+        except Exception:
+            pass
+
+    # Google News 영어 (topic_en 기반, 최근 3일)
+    if topic_en:
+        try:
+            encoded = quote(topic_en)
+            url = f"https://news.google.com/rss/search?q={encoded}+when:3d&hl=en&gl=US&ceid=US:en"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                xml_data = resp.read()
+            root = ET.fromstring(xml_data)
+            for item in root.findall(".//item")[:10]:
+                title = item.find("title")
+                source = item.find("source")
+                pub_date = item.find("pubDate")
+                if title is not None and title.text:
+                    result["google_news_en"].append({
+                        "headline": title.text.strip(),
+                        "source": source.text.strip() if source is not None and source.text else "",
+                        "date": pub_date.text.strip() if pub_date is not None and pub_date.text else "",
+                    })
+        except Exception:
+            pass
+
+    # Seeking Alpha 레이팅 (관련 티커 기반)
+    if tickers and RAPIDAPI_KEY:
+        ticker_list = [t.strip() for t in tickers.split(",") if t.strip()]
+        for symbol in ticker_list[:5]:
+            data = _sa_get("/symbols/get-ratings", {"symbol": symbol})
+            if data and "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+                try:
+                    r = data["data"][0].get("attributes", {}).get("ratings", {})
+                    result["seeking_alpha_ratings"].append({
+                        "symbol": symbol,
+                        "wall_street": round(r.get("sellSideRating", 0), 2) if r.get("sellSideRating") else "",
+                        "quant": round(r.get("quantRating", 0), 2) if r.get("quantRating") else "",
+                        "authors": round(r.get("authorsRating", 0), 2) if r.get("authorsRating") else "",
+                    })
+                except Exception:
+                    continue
+
+    return result
+
+
+# ============================================================
+# 8. 통합 JSON 데이터 (기존 호환)
 # ============================================================
 @app.get("/api/daily-briefing")
 async def get_daily_briefing():
